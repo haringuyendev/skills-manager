@@ -404,6 +404,11 @@
       "git": "Git",
       "skillssh": "skills.sh"
     },
+    "repositoryFilter": {
+      "label": "仓库",
+      "all": "全部仓库",
+      "other": "其他"
+    },
     "tags": {
       "filter": "标签",
       "allTags": "全部标签",

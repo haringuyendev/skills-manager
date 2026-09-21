@@ -374,6 +374,11 @@
       "git": "Git",
       "skillssh": "skills.sh"
     },
+    "repositoryFilter": {
+      "label": "儲存庫",
+      "all": "全部儲存庫",
+      "other": "其他"
+    },
     "tags": {
       "filter": "標籤",
       "allTags": "全部標籤",

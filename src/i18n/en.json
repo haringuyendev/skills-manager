@@ -404,6 +404,11 @@
       "git": "Git",
       "skillssh": "skills.sh"
     },
+    "repositoryFilter": {
+      "label": "Repository",
+      "all": "All repos",
+      "other": "Other"
+    },
     "tags": {
       "filter": "Tags",
       "allTags": "All Tags",
