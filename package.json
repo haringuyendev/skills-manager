@@ -8,6 +8,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
+    "test:skill-sources": "node --experimental-strip-types --test scripts/skillSources.test.ts",
     "preview": "vite preview",
     "release:prepare": "node scripts/prepare-release.mjs",
     "tauri": "tauri",
