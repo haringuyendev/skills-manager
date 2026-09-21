@@ -44,6 +44,11 @@ import { ToggleSwitch } from "../components/ToggleSwitch";
 import { CardActionMenu } from "../components/CardActionMenu";
 import * as api from "../lib/tauri";
 import { getTagActiveColor, getTagColor, pruneStaleTagFilters, UNTAGGED_FILTER } from "../lib/skillTags";
+import {
+  ALL_REPOS_FILTER,
+  getGitRepositoryKey,
+  getGitRepositoryOptions,
+} from "../lib/skillSources";
 import type {
   ManagedSkill,
   ToolInfo,
@@ -152,6 +157,7 @@ export function MySkills() {
   const [viewMode, setViewMode] = useState<"grid" | "list">("grid");
   const [filterMode, setFilterMode] = useState<"all" | "enabled" | "available">("all");
   const [sourceFilters, setSourceFilters] = useState<Set<string>>(new Set());
+  const [repoFilter, setRepoFilter] = useState(ALL_REPOS_FILTER);
   const [tagFilters, setTagFilters] = useState<Set<string>>(new Set());
   const [allTags, setAllTags] = useState<string[]>([]);
   // Tag management from the filter bar (#233): right-click a tag pill to
@@ -230,6 +236,20 @@ export function MySkills() {
     setTagFilters((prev) => pruneStaleTagFilters(prev, available, hasUntagged));
   }, [allTags, skills]);
 
+  const repoOptions = useMemo(
+    () => getGitRepositoryOptions(skills),
+    [skills],
+  );
+
+  useEffect(() => {
+    if (
+      repoFilter !== ALL_REPOS_FILTER &&
+      !repoOptions.some((option) => option.key === repoFilter)
+    ) {
+      setRepoFilter(ALL_REPOS_FILTER);
+    }
+  }, [repoFilter, repoOptions]);
+
   // Close the tag context menu on Escape (click-outside is handled by its backdrop).
   useEffect(() => {
     if (!tagMenu) return;
@@ -254,11 +274,13 @@ export function MySkills() {
   const hasActiveFilters =
     search.trim() !== "" ||
     sourceFilters.size > 0 ||
+    repoFilter !== ALL_REPOS_FILTER ||
     tagFilters.size > 0 ||
     filterMode !== "all";
   const clearFilters = () => {
     setSearch("");
     setSourceFilters(new Set());
+    setRepoFilter(ALL_REPOS_FILTER);
     setTagFilters(new Set());
     setFilterMode("all");
   };
@@ -290,6 +312,13 @@ export function MySkills() {
         displayName.toLowerCase().includes(search.toLowerCase()) ||
         (skill.description || "").toLowerCase().includes(search.toLowerCase());
       if (!matchesSearch) return false;
+
+      if (
+        repoFilter !== ALL_REPOS_FILTER &&
+        getGitRepositoryKey(skill) !== repoFilter
+      ) {
+        return false;
+      }
 
       if (sourceFilters.size > 0 && !sourceFilters.has(skill.source_type)) return false;
 
@@ -325,7 +354,7 @@ export function MySkills() {
     }
 
     return result;
-  }, [skills, skillDisplayNames, search, sourceFilters, tagFilters, filterMode, viewedPreset, presetSkillOrder]);
+  }, [skills, skillDisplayNames, search, repoFilter, sourceFilters, tagFilters, filterMode, viewedPreset, presetSkillOrder]);
 
   const {
     isMultiSelect, setIsMultiSelect,
@@ -345,6 +374,7 @@ export function MySkills() {
       [...sourceFilters].sort(),
       [...tagFilters].sort(),
       filterMode,
+      repoFilter,
       viewedPreset?.id ?? null,
     ]),
     escapeEnabled: !batchTagDialogOpen && !batchSyncDialogOpen && !batchDeleteConfirm,
@@ -1241,6 +1271,31 @@ export function MySkills() {
             {t(`mySkills.sourceFilter.${src}`)}
           </button>
         ))}
+        {repoOptions.length > 0 && (
+          <label className="inline-flex items-center gap-1.5 text-[12px] text-muted">
+            <span className="sr-only">{t("mySkills.repositoryFilter.label")}</span>
+            <select
+              value={repoFilter}
+              onChange={(event) => setRepoFilter(event.target.value)}
+              aria-label={t("mySkills.repositoryFilter.label")}
+              className="app-input h-7 py-0 text-[12px] font-medium"
+            >
+              <option value={ALL_REPOS_FILTER}>
+                {t("mySkills.repositoryFilter.all")}
+              </option>
+              {repoOptions.map((option) => {
+                const optionLabel = option.isOther
+                  ? t("mySkills.repositoryFilter.other")
+                  : option.label;
+                return (
+                  <option key={option.key} value={option.key}>
+                    {optionLabel} ({option.count})
+                  </option>
+                );
+              })}
+            </select>
+          </label>
+        )}
         {allTags.length > 0 && (
           <>
             <span className="mx-0.5 h-3 w-px bg-border-subtle" />
