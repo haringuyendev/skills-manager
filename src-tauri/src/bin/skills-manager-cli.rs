@@ -4607,13 +4607,23 @@ mod tests {
             fs::read_to_string(second_target.join("demo/SKILL.md")).unwrap(),
             "central skill"
         );
+        fs::create_dir_all(second_target.join("nested")).unwrap();
+        fs::rename(
+            second_target.join("demo"),
+            second_target.join("nested/demo"),
+        )
+        .unwrap();
 
-        run_projects(
+        let dry_run_error = run_projects(
             ProjectsArgs {
                 command: ProjectsCommand::RemovePreset(RemoveProjectPresetArgs {
                     project_ref: project.id.clone(),
                     preset_ref: "preset-main".to_string(),
-                    agents: vec!["first_agent".to_string(), "second_agent".to_string()],
+                    agents: vec![
+                        "first_agent".to_string(),
+                        "second_agent".to_string(),
+                        "unknown_agent".to_string(),
+                    ],
                     safety: ProjectRemoveSafetyArgs {
                         dry_run: true,
                         yes: false,
@@ -4621,11 +4631,16 @@ mod tests {
                 }),
             },
             &store,
-            false,
+            true,
         )
-        .unwrap();
+        .unwrap_err();
+        let would_remove = &error_envelope(&dry_run_error)["details"]["report"]["would_remove"];
+        assert_eq!(would_remove[0]["agent"], "first_agent");
+        assert_eq!(would_remove[0]["relative_path"], "demo");
+        assert_eq!(would_remove[1]["agent"], "second_agent");
+        assert_eq!(would_remove[1]["relative_path"], "nested/demo");
         assert!(first_target.join("demo").is_dir());
-        assert!(second_target.join("demo").is_dir());
+        assert!(second_target.join("nested/demo").is_dir());
 
         store
             .set_setting("disabled_tools", r#"["first_agent"]"#)
@@ -4647,7 +4662,7 @@ mod tests {
         )
         .unwrap();
         assert!(!first_target.join("demo").exists());
-        assert!(!second_target.join("demo").exists());
+        assert!(!second_target.join("nested/demo").exists());
         assert!(central_path.is_dir());
         assert!(central_path.join("SKILL.md").is_file());
     }
