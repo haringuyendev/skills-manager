@@ -297,6 +297,27 @@ The no-`--agent` defaults intentionally differ: deploy targets all installed, en
 
 Preset create/update/delete and add-skill/remove-skill are organization-only CLI operations. They never deploy or undeploy agent files implicitly.
 
+## Projects
+
+Link an existing project directory to Skills Manager so it appears in the desktop app's Projects area:
+
+```bash
+"$SM" projects add "/path/to/project"
+"$SM" --json projects list
+```
+
+`projects add` requires an existing directory. It stores the canonical path in the app's shared database and creates `.claude/skills` and `.claude/skills-disabled` under that directory when needed. Project commands always use the app database; `--skills-root` does not redirect them. If the path is already linked, add reports the existing project instead of creating a duplicate; use `projects list` to inspect it.
+
+Linking a project only registers it with Skills Manager. It does not install, deploy, or attach any skill. Use the app's existing project UI to manage skills in that project.
+
+To unlink a project, pass its ID, exact name, or path:
+
+```bash
+"$SM" projects remove "/path/to/project"
+```
+
+Only run `projects remove` when the user asked to unlink it. Removal deletes the project record from the app database and keeps the project directory, skill folders, and files. If multiple projects share a name, use the ID or path instead.
+
 ## Health check
 
 When sync misbehaves or a command errors in a confusing way:
@@ -329,6 +350,13 @@ Use `agents disable <agent>` when the user wants the whole Agent integration tur
 ```
 
 The `preset_ids`, `presets`, `deployed_to`, `tags`, and `source_type` fields are usually the most informative. The legacy `enabled` field is not deployment state.
+
+### "Link this project to Skills Manager"
+
+1. Use the project path the user provided and run `projects add <path>`.
+2. If it reports that the project is already linked, run `projects list` and report the existing entry.
+3. Otherwise, confirm the new entry with `projects list` or the successful add result.
+4. Explain that the link makes the project available in the app's Projects area; the user can manage/attach project skills there. The link itself does not deploy skills.
 
 ### "Pull in the skills already installed in my agent directories"
 

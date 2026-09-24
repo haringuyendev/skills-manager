@@ -623,38 +623,7 @@ pub async fn add_project(
 ) -> Result<ProjectDto, AppError> {
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let project_path = Path::new(&path);
-        if !project_path.is_dir() {
-            return Err(AppError::invalid_input("Directory does not exist"));
-        }
-        let claude_dir = project_path.join(".claude");
-        let skills_dir = claude_dir.join("skills");
-        let disabled_dir = claude_dir.join("skills-disabled");
-
-        // Support initializing an empty project directory as a managed project.
-        std::fs::create_dir_all(&skills_dir)?;
-        std::fs::create_dir_all(&disabled_dir)?;
-
-        let name = project_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-
-        let now = chrono::Utc::now().timestamp_millis();
-        let record = ProjectRecord {
-            id: uuid::Uuid::new_v4().to_string(),
-            name,
-            path: path.clone(),
-            workspace_type: "project".to_string(),
-            linked_agent_key: None,
-            linked_agent_name: None,
-            disabled_path: None,
-            sort_order: 0,
-            created_at: now,
-            updated_at: now,
-        };
-
-        store.insert_project(&record).map_err(AppError::db)?;
+        let record = crate::core::project_service::add_project(&store, Path::new(&path))?;
         let all_managed = store.get_all_skills().map_err(AppError::db)?;
         let configs = agent_skill_configs(&store);
         Ok(project_to_dto(&record, &all_managed, &configs))
