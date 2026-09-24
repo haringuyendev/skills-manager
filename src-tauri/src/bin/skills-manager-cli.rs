@@ -67,8 +67,17 @@ enum ProjectsCommand {
         #[arg(long = "agent", value_name = "AGENT", required = true)]
         agents: Vec<String>,
     },
+    /// Copy every skill in a preset into the project for selected agents.
+    AddPreset {
+        project_ref: String,
+        preset_ref: String,
+        #[arg(long = "agent", value_name = "AGENT", required = true)]
+        agents: Vec<String>,
+    },
     /// Remove one project-local skill from selected agents.
     RemoveSkill(RemoveProjectSkillArgs),
+    /// Remove project-local copies of every skill in a preset.
+    RemovePreset(RemoveProjectPresetArgs),
 }
 
 #[derive(Args, Debug)]
@@ -87,6 +96,16 @@ struct RemoveProjectSkillArgs {
     project_ref: String,
     /// Path relative to the selected agent's skills root.
     skill_relative_path: String,
+    #[arg(long = "agent", value_name = "AGENT", required = true)]
+    agents: Vec<String>,
+    #[command(flatten)]
+    safety: ProjectRemoveSafetyArgs,
+}
+
+#[derive(Args, Debug)]
+struct RemoveProjectPresetArgs {
+    project_ref: String,
+    preset_ref: String,
     #[arg(long = "agent", value_name = "AGENT", required = true)]
     agents: Vec<String>,
     #[command(flatten)]
@@ -1169,6 +1188,84 @@ fn run_projects(args: ProjectsArgs, store: &SkillStore, json: bool) -> anyhow::R
             }
             finish_project_batch(report, json)?;
         }
+        ProjectsCommand::AddPreset {
+            project_ref,
+            preset_ref,
+            agents,
+        } => {
+            let project = resolve_cli_project(store, &project_ref)?;
+            let preset = resolve_scenario(store, &preset_ref)?;
+            let skills = store.get_skills_for_scenario(&preset.id)?;
+            let validation = validate_project_agents(store, &project, &agents, true, "")?;
+            let existing = app_lib::core::project_skill_service::scan_project_skill_variants(
+                store,
+                &project.id,
+            )
+            .map_err(map_app_err)?;
+            let mut report = ProjectBatchReport::new(&project, "add_preset");
+
+            for skill in skills {
+                let relative_path = app_lib::core::sync_engine::target_dir_name(
+                    Path::new(&skill.central_path),
+                    &skill.name,
+                );
+                add_validation_failures(
+                    &mut report,
+                    validation
+                        .failures
+                        .iter()
+                        .map(|failure| ProjectAgentValidationFailure {
+                            agent: failure.agent.clone(),
+                            message: failure.message.clone(),
+                            path: failure.path.clone(),
+                        })
+                        .collect(),
+                    Some(skill.id.clone()),
+                    skill.name.clone(),
+                    relative_path.clone(),
+                );
+                for agent in &validation.valid_agents {
+                    if let Some(variant) = existing.iter().find(|variant| {
+                        variant.skill_id.as_deref() == Some(skill.id.as_str())
+                            && variant.agent == *agent
+                    }) {
+                        report.skipped.push(project_action_item(
+                            &report,
+                            variant.clone(),
+                            "already_present",
+                        ));
+                        continue;
+                    }
+                    match app_lib::core::project_skill_service::add_skill_to_project(
+                        store,
+                        &project.id,
+                        &skill.id,
+                        agent,
+                    ) {
+                        Ok(app_lib::core::project_skill_service::AddProjectSkillOutcome::Added(
+                            variant,
+                        )) => report.added.push(project_action_item(&report, variant, "added")),
+                        Ok(app_lib::core::project_skill_service::AddProjectSkillOutcome::AlreadyPresent(
+                            variant,
+                        )) => report.skipped.push(project_action_item(
+                            &report,
+                            variant,
+                            "already_present",
+                        )),
+                        Err(error) => report.failed.push(project_action_failure(
+                            &report,
+                            Some(skill.id.clone()),
+                            skill.name.clone(),
+                            agent.clone(),
+                            relative_path.clone(),
+                            project_agent_target_path(store, &project, agent, &relative_path),
+                            error.to_string(),
+                        )),
+                    }
+                }
+            }
+            finish_project_batch(report, json)?;
+        }
         ProjectsCommand::RemoveSkill(args) => {
             let project = resolve_cli_project(store, &args.project_ref)?;
             let validation = validate_project_agents(
@@ -1237,8 +1334,106 @@ fn run_projects(args: ProjectsArgs, store: &SkillStore, json: bool) -> anyhow::R
             }
             finish_project_batch(report, json)?;
         }
+        ProjectsCommand::RemovePreset(args) => {
+            let project = resolve_cli_project(store, &args.project_ref)?;
+            let preset = resolve_scenario(store, &args.preset_ref)?;
+            let skills = store.get_skills_for_scenario(&preset.id)?;
+            let validation = validate_project_agents(store, &project, &args.agents, false, "")?;
+            let variants = app_lib::core::project_skill_service::scan_project_skill_variants(
+                store,
+                &project.id,
+            )
+            .map_err(map_app_err)?;
+            let mut report = ProjectBatchReport::new(&project, "remove_preset");
+
+            for skill in skills {
+                let fallback_path = app_lib::core::sync_engine::target_dir_name(
+                    Path::new(&skill.central_path),
+                    &skill.name,
+                );
+                add_validation_failures(
+                    &mut report,
+                    validation
+                        .failures
+                        .iter()
+                        .map(|failure| ProjectAgentValidationFailure {
+                            agent: failure.agent.clone(),
+                            message: failure.message.clone(),
+                            path: failure.path.clone(),
+                        })
+                        .collect(),
+                    Some(skill.id.clone()),
+                    skill.name.clone(),
+                    fallback_path.clone(),
+                );
+                for agent in &validation.valid_agents {
+                    let Some(variant) = variants
+                        .iter()
+                        .find(|variant| {
+                            variant.skill_id.as_deref() == Some(skill.id.as_str())
+                                && variant.agent == *agent
+                        })
+                        .cloned()
+                    else {
+                        report.skipped.push(project_action_not_found(
+                            &report,
+                            fallback_path.clone(),
+                            agent.clone(),
+                        ));
+                        continue;
+                    };
+                    if args.safety.dry_run {
+                        report.would_remove.push(project_action_item(
+                            &report,
+                            variant,
+                            "would_remove",
+                        ));
+                        continue;
+                    }
+                    match app_lib::core::project_skill_service::remove_skill_from_project(
+                        store,
+                        &project.id,
+                        &variant.relative_path,
+                        agent,
+                    ) {
+                        Ok(()) => report
+                            .removed
+                            .push(project_action_item(&report, variant, "removed")),
+                        Err(error) => report.failed.push(project_action_failure(
+                            &report,
+                            variant.skill_id,
+                            variant.skill_name,
+                            agent.clone(),
+                            variant.relative_path,
+                            Some(variant.absolute_path.to_string_lossy().into_owned()),
+                            error.to_string(),
+                        )),
+                    }
+                }
+            }
+            finish_project_batch(report, json)?;
+        }
     }
     Ok(())
+}
+
+fn project_agent_target_path(
+    store: &SkillStore,
+    project: &app_lib::core::skill_store::ProjectRecord,
+    agent: &str,
+    relative_path: &str,
+) -> Option<String> {
+    app_lib::core::project_skill_service::list_project_agent_targets(store, &project.id)
+        .ok()?
+        .into_iter()
+        .find(|target| target.key == agent)
+        .map(|target| {
+            target
+                .skills_root
+                .join(relative_path)
+                .to_string_lossy()
+                .into_owned()
+        })
 }
 
 fn resolve_cli_project(
@@ -4059,6 +4254,73 @@ mod tests {
         .is_err());
     }
 
+    #[test]
+    fn parses_project_preset_commands_and_remove_safety() {
+        let add = Cli::try_parse_from([
+            "skills-manager-cli",
+            "projects",
+            "add-preset",
+            "repo",
+            "current",
+            "--agent",
+            "codex",
+        ])
+        .unwrap();
+        assert!(matches!(
+            add.command,
+            Commands::Projects(ProjectsArgs { command: ProjectsCommand::AddPreset { project_ref, preset_ref, agents } })
+                if project_ref == "repo" && preset_ref == "current" && agents == vec!["codex"]
+        ));
+
+        let dry_run = Cli::try_parse_from([
+            "skills-manager-cli",
+            "projects",
+            "remove-preset",
+            "repo",
+            "web",
+            "--agent",
+            "codex",
+            "--dry-run",
+        ])
+        .unwrap();
+        assert!(
+            matches!(dry_run.command, Commands::Projects(ProjectsArgs { command: ProjectsCommand::RemovePreset(args) }) if args.safety.dry_run && !args.safety.yes)
+        );
+        let confirmed = Cli::try_parse_from([
+            "skills-manager-cli",
+            "projects",
+            "remove-preset",
+            "repo",
+            "web",
+            "--agent",
+            "codex",
+            "--yes",
+        ])
+        .unwrap();
+        assert!(
+            matches!(confirmed.command, Commands::Projects(ProjectsArgs { command: ProjectsCommand::RemovePreset(args) }) if args.safety.yes && !args.safety.dry_run)
+        );
+
+        assert!(Cli::try_parse_from([
+            "skills-manager-cli",
+            "projects",
+            "add-preset",
+            "repo",
+            "web"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "skills-manager-cli",
+            "projects",
+            "remove-preset",
+            "repo",
+            "web",
+            "--agent",
+            "codex",
+        ])
+        .is_err());
+    }
+
     fn setup_project_skill_cli(
         tmp: &tempfile::TempDir,
     ) -> (SkillStore, ProjectRecord, PathBuf, PathBuf, PathBuf) {
@@ -4244,6 +4506,150 @@ mod tests {
             envelope["details"]["report"]["failed"][0]["path"],
             expected_disabled_path
         );
+    }
+
+    #[test]
+    fn projects_preset_batches_preserve_order_partial_results_and_project_only_removals() {
+        let tmp = tempdir().unwrap();
+        let (store, project, central_path, first_target, second_target) =
+            setup_project_skill_cli(&tmp);
+        let missing_source = tmp.path().join("central/broken");
+        store
+            .insert_skill(&SkillRecord {
+                id: "skill-broken".to_string(),
+                name: "broken".to_string(),
+                description: None,
+                source_type: "local".to_string(),
+                source_ref: None,
+                source_ref_resolved: None,
+                source_subpath: None,
+                source_branch: None,
+                source_revision: None,
+                remote_revision: None,
+                central_path: missing_source.to_string_lossy().into_owned(),
+                content_hash: None,
+                enabled: true,
+                created_at: 2,
+                updated_at: 2,
+                status: "ok".to_string(),
+                update_status: "local_only".to_string(),
+                last_checked_at: None,
+                last_check_error: None,
+            })
+            .unwrap();
+        store
+            .insert_scenario(&ScenarioRecord {
+                id: "preset-main".to_string(),
+                name: "Main".to_string(),
+                description: None,
+                icon: None,
+                sort_order: 0,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        store
+            .add_skill_to_scenario("preset-main", "skill-demo")
+            .unwrap();
+        store
+            .add_skill_to_scenario("preset-main", "skill-broken")
+            .unwrap();
+        store
+            .reorder_scenario_skills(
+                "preset-main",
+                &["skill-demo".to_string(), "skill-broken".to_string()],
+            )
+            .unwrap();
+        store
+            .insert_scenario(&ScenarioRecord {
+                id: "preset-overlap".to_string(),
+                name: "Overlap".to_string(),
+                description: None,
+                icon: None,
+                sort_order: 1,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        store
+            .add_skill_to_scenario("preset-overlap", "skill-demo")
+            .unwrap();
+        app_lib::core::project_skill_service::add_skill_to_project(
+            &store,
+            &project.id,
+            "skill-demo",
+            "first_agent",
+        )
+        .unwrap();
+        fs::write(first_target.join("demo/SKILL.md"), "existing copy").unwrap();
+
+        let error = run_projects(
+            ProjectsArgs {
+                command: ProjectsCommand::AddPreset {
+                    project_ref: project.id.clone(),
+                    preset_ref: "preset-main".to_string(),
+                    agents: vec!["first_agent".to_string(), "second_agent".to_string()],
+                },
+            },
+            &store,
+            true,
+        )
+        .unwrap_err();
+        let report = &error_envelope(&error)["details"]["report"];
+        assert_eq!(report["skipped"][0]["agent"], "first_agent");
+        assert_eq!(report["added"][0]["agent"], "second_agent");
+        assert_eq!(report["failed"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            fs::read_to_string(first_target.join("demo/SKILL.md")).unwrap(),
+            "existing copy"
+        );
+        assert_eq!(
+            fs::read_to_string(second_target.join("demo/SKILL.md")).unwrap(),
+            "central skill"
+        );
+
+        run_projects(
+            ProjectsArgs {
+                command: ProjectsCommand::RemovePreset(RemoveProjectPresetArgs {
+                    project_ref: project.id.clone(),
+                    preset_ref: "preset-main".to_string(),
+                    agents: vec!["first_agent".to_string(), "second_agent".to_string()],
+                    safety: ProjectRemoveSafetyArgs {
+                        dry_run: true,
+                        yes: false,
+                    },
+                }),
+            },
+            &store,
+            false,
+        )
+        .unwrap();
+        assert!(first_target.join("demo").is_dir());
+        assert!(second_target.join("demo").is_dir());
+
+        store
+            .set_setting("disabled_tools", r#"["first_agent"]"#)
+            .unwrap();
+        run_projects(
+            ProjectsArgs {
+                command: ProjectsCommand::RemovePreset(RemoveProjectPresetArgs {
+                    project_ref: project.id.clone(),
+                    preset_ref: "preset-main".to_string(),
+                    agents: vec!["first_agent".to_string(), "second_agent".to_string()],
+                    safety: ProjectRemoveSafetyArgs {
+                        dry_run: false,
+                        yes: true,
+                    },
+                }),
+            },
+            &store,
+            false,
+        )
+        .unwrap();
+        assert!(!first_target.join("demo").exists());
+        assert!(!second_target.join("demo").exists());
+        assert!(central_path.is_dir());
+        assert!(central_path.join("SKILL.md").is_file());
     }
 
     #[test]
