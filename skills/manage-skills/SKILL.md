@@ -326,8 +326,12 @@ project and never overwrite an existing project copy; the report marks it
 does not create a project-to-preset relationship, so later preset edits do not
 change the project automatically.
 
-Remove only project-local copies. Preview first, inspect the report, then repeat
-with `--yes` to apply the same request:
+Remove only project-local copies. `remove-skill` takes a path relative to the
+selected agent's skills root; it does not resolve a central skill name or ID.
+For example, `react-best-practices` below means that exact project directory
+under the agent's skills root. Use the `relative_path` shown by a preset preview
+when removing a preset member individually. Preview first, inspect the report,
+then repeat with `--yes` to apply the same request:
 
 ```bash
 "$SM" projects remove-skill "/path/to/project" react-best-practices --agent codex --dry-run
