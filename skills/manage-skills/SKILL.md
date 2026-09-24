@@ -308,7 +308,45 @@ Link an existing project directory to Skills Manager so it appears in the deskto
 
 `projects add` requires an existing directory. It stores the canonical path in the app's shared database and creates `.claude/skills` and `.claude/skills-disabled` under that directory when needed. Project commands always use the app database; `--skills-root` does not redirect them. If the path is already linked, add reports the existing project instead of creating a duplicate; use `projects list` to inspect it.
 
-Linking a project only registers it with Skills Manager. It does not install, deploy, or attach any skill. Use the app's existing project UI to manage skills in that project.
+Linking a project only registers it with Skills Manager. It does not install, deploy, or attach any skill. Use the project commands below to manage project-local copies.
+
+### Project skill and preset copies
+
+Add central-library skills to a linked project with an explicit target agent:
+
+```bash
+"$SM" projects add-skill "/path/to/project" react-best-practices --agent codex
+"$SM" projects add-preset "/path/to/project" "Web Dev" --agent codex --agent claude_code
+```
+
+`--agent` is mandatory for every add. Each target agent must be enabled and
+installed for that project. Adds copy the current central skill content into the
+project and never overwrite an existing project copy; the report marks it
+`skipped` instead. Adding a preset copies its current member skills only. It
+does not create a project-to-preset relationship, so later preset edits do not
+change the project automatically.
+
+Remove only project-local copies. Preview first, inspect the report, then repeat
+with `--yes` to apply the same request:
+
+```bash
+"$SM" projects remove-skill "/path/to/project" react-best-practices --agent codex --dry-run
+"$SM" projects remove-skill "/path/to/project" react-best-practices --agent codex --yes
+
+"$SM" projects remove-preset "/path/to/project" "Web Dev" --agent codex --dry-run
+"$SM" projects remove-preset "/path/to/project" "Web Dev" --agent codex --yes
+```
+
+Removal leaves central-library copies untouched. A known agent can still be
+cleaned up when it is now disabled or uninstalled. Removing a preset removes
+the project copies of its current member skills even when another preset also
+contains those skills; there is no shared project-preset relationship to retain.
+
+For batch commands, add `--json` when inspecting programmatically. Read the
+`added`, `removed`, `skipped`, and `failed` arrays (and `would_remove` for a
+dry run). On a nonzero `PROJECT_BATCH_PARTIAL_FAILURE`, those arrays remain in
+`details.report`, including completed operations; inspect that report before
+deciding whether any retry is appropriate.
 
 To unlink a project, pass its ID, exact name, or path:
 
