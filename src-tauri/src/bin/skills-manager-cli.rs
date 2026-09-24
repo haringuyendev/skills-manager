@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -29,10 +30,30 @@ enum Commands {
     Repo(RepoArgs),
     #[command(name = "agents", visible_alias = "tools")]
     Tools(ToolsArgs),
+    Projects(ProjectsArgs),
     Skills(SkillsArgs),
     #[command(alias = "scenarios")]
     Presets(PresetArgs),
     Git(GitArgs),
+}
+
+#[derive(Args, Debug)]
+struct ProjectsArgs {
+    #[command(subcommand)]
+    command: ProjectsCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum ProjectsCommand {
+    /// Link an existing project directory to the desktop app.
+    Add { path: PathBuf },
+    /// List linked projects in the app database.
+    List,
+    /// Remove a project link only; project files are kept.
+    Remove {
+        /// Project ID, exact name, or path.
+        project_ref: String,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -687,7 +708,8 @@ fn main() {
 }
 
 fn run(cli: Cli) -> anyhow::Result<()> {
-    if let Some(skills_root) = &cli.skills_root {
+    let is_projects_command = matches!(&cli.command, Commands::Projects(_));
+    if let Some(skills_root) = cli.skills_root.as_ref().filter(|_| !is_projects_command) {
         let base = central_repo::external_base_dir(skills_root);
         central_repo::set_runtime_base_dir_override(Some(base));
         central_repo::set_runtime_skills_dir_override(Some(skills_root.clone()));
@@ -698,6 +720,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Commands::Repo(args) => run_repo(args, &store, cli.json),
         Commands::Tools(args) => run_tools(args, &store, cli.json),
+        Commands::Projects(args) => run_projects(args, &store, cli.json),
         Commands::Skills(args) => run_skills(args, &store, cli.json),
         Commands::Presets(args) => run_presets(args, &store, cli.json),
         Commands::Git(args) => run_git(args, &store, cli.skills_root.is_some(), cli.json),
@@ -721,6 +744,201 @@ fn run_repo(args: RepoArgs, store: &SkillStore, json: bool) -> anyhow::Result<()
         }
     }
     Ok(())
+}
+
+#[derive(Serialize)]
+struct ProjectListEntry {
+    id: String,
+    name: String,
+    path: String,
+    workspace_type: String,
+    skill_count: usize,
+    created_at: i64,
+    updated_at: i64,
+}
+
+fn run_projects(args: ProjectsArgs, store: &SkillStore, json: bool) -> anyhow::Result<()> {
+    match args.command {
+        ProjectsCommand::Add { path } => {
+            let record = app_lib::core::project_service::add_project(store, &path)
+                .map_err(map_app_err)?;
+            if json {
+                print_json(&record, true);
+            } else {
+                println!("Linked project '{}' at {}", record.name, record.path);
+            }
+        }
+        ProjectsCommand::List => {
+            let projects = list_project_entries(store).map_err(map_app_err)?;
+            if json {
+                print_json(&projects, true);
+            } else if projects.is_empty() {
+                println!("No projects linked.");
+            } else {
+                for project in projects {
+                    println!(
+                        "{}  {}  [{} skills]  id: {}",
+                        project.name, project.path, project.skill_count, project.id
+                    );
+                }
+            }
+        }
+        ProjectsCommand::Remove { project_ref } => {
+            let projects = store.get_all_projects().map_err(AppError::db).map_err(map_app_err)?;
+            let removed = resolve_project_reference(&projects, &project_ref)?;
+            store
+                .delete_project(&removed.id)
+                .map_err(AppError::db)
+                .map_err(map_app_err)?;
+            if json {
+                print_json(&removed, true);
+            } else {
+                println!(
+                    "Unlinked project '{}' at {}. Project files were kept.",
+                    removed.name, removed.path
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn list_project_entries(store: &SkillStore) -> Result<Vec<ProjectListEntry>, AppError> {
+    let records = store.get_all_projects().map_err(AppError::db)?;
+    let configs = project_agent_configs(store);
+    Ok(records
+        .into_iter()
+        .map(|record| {
+            let skills = if record.workspace_type == "linked" {
+                app_lib::core::project_scanner::read_linked_workspace_skills(
+                    Path::new(&record.path),
+                    record.disabled_path.as_deref().map(Path::new),
+                    record.linked_agent_key.as_deref().unwrap_or(&record.name),
+                    record.linked_agent_name.as_deref().unwrap_or(&record.name),
+                    true,
+                )
+            } else {
+                app_lib::core::project_scanner::read_project_skills(
+                    Path::new(&record.path),
+                    &configs,
+                )
+            };
+            let skill_count = skills
+                .iter()
+                .map(|skill| skill.relative_path.to_lowercase())
+                .collect::<HashSet<_>>()
+                .len();
+            ProjectListEntry {
+                id: record.id,
+                name: record.name,
+                path: record.path,
+                workspace_type: record.workspace_type,
+                skill_count,
+                created_at: record.created_at,
+                updated_at: record.updated_at,
+            }
+        })
+        .collect())
+}
+
+fn project_agent_configs(
+    store: &SkillStore,
+) -> Vec<app_lib::core::project_scanner::AgentSkillConfig> {
+    let mut grouped: Vec<(String, Vec<(String, String)>)> = Vec::new();
+    for adapter in tool_adapters::all_tool_adapters(store) {
+        let relative_skills_dir = adapter.project_relative_skills_dir().to_string();
+        if relative_skills_dir.is_empty() {
+            continue;
+        }
+        if let Some((_, agents)) = grouped
+            .iter_mut()
+            .find(|(dir, _)| *dir == relative_skills_dir)
+        {
+            agents.push((adapter.key, adapter.display_name));
+        } else {
+            grouped.push((
+                relative_skills_dir,
+                vec![(adapter.key, adapter.display_name)],
+            ));
+        }
+    }
+
+    grouped
+        .into_iter()
+        .filter_map(|(relative_skills_dir, agents)| {
+            let (key, first_display_name) = agents.first()?.clone();
+            let display_name = if agents.len() == 1 {
+                first_display_name
+            } else {
+                agents
+                    .into_iter()
+                    .map(|(_, display_name)| display_name)
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            };
+            Some(app_lib::core::project_scanner::AgentSkillConfig {
+                key,
+                display_name,
+                relative_skills_dir,
+            })
+        })
+        .collect()
+}
+
+fn resolve_project_reference(
+    projects: &[app_lib::core::skill_store::ProjectRecord],
+    reference: &str,
+) -> anyhow::Result<app_lib::core::skill_store::ProjectRecord> {
+    if let Some(project) = projects.iter().find(|project| project.id == reference) {
+        return Ok(project.clone());
+    }
+
+    let canonical_reference = Path::new(reference).canonicalize().ok();
+    let path_matches: Vec<_> = projects
+        .iter()
+        .filter(|project| {
+            project.path == reference
+                || canonical_reference.as_ref().is_some_and(|canonical| {
+                    Path::new(&project.path)
+                        .canonicalize()
+                        .map(|path| &path == canonical)
+                        .unwrap_or(false)
+                })
+        })
+        .collect();
+    match path_matches.as_slice() {
+        [project] => return Ok((*project).clone()),
+        [] => {}
+        candidates => {
+            let details = candidates
+                .iter()
+                .map(|project| {
+                    format!("{} (id: {}, path: {})", project.name, project.id, project.path)
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            bail!("Project path '{reference}' is ambiguous; use an ID. Candidates: {details}");
+        }
+    }
+
+    let matches: Vec<_> = projects
+        .iter()
+        .filter(|project| project.name == reference)
+        .collect();
+    match matches.as_slice() {
+        [project] => Ok((*project).clone()),
+        [] => bail!("No project matches '{reference}'"),
+        candidates => {
+            let details = candidates
+                .iter()
+                .map(|project| {
+                    format!("{} (id: {}, path: {})", project.name, project.id, project.path)
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            bail!("Project name '{reference}' is ambiguous; use an ID or path. Candidates: {details}")
+        }
+    }
 }
 
 fn repo_status(store: &SkillStore) -> RepoStatus {
@@ -3081,7 +3299,7 @@ mod tests {
     }
 
     use super::*;
-    use app_lib::core::skill_store::{ScenarioRecord, SkillRecord};
+    use app_lib::core::skill_store::{ProjectRecord, ScenarioRecord, SkillRecord};
     use app_lib::core::tool_adapters::{CustomToolDef, ToolCategory};
     use std::fs;
     use tempfile::tempdir;
@@ -3177,6 +3395,177 @@ mod tests {
                 }
             }) if reference == "Web Dev" && agents == vec!["codex"]
         ));
+    }
+
+    #[test]
+    fn parses_project_commands_and_global_json_flag() {
+        let add = Cli::try_parse_from([
+            "skills-manager-cli",
+            "--json",
+            "projects",
+            "add",
+            "./repo",
+        ])
+        .unwrap();
+        assert!(add.json);
+        assert!(matches!(
+            add.command,
+            Commands::Projects(ProjectsArgs {
+                command: ProjectsCommand::Add { path }
+            }) if path == Path::new("./repo")
+        ));
+
+        let list = Cli::try_parse_from(["skills-manager-cli", "projects", "list"]).unwrap();
+        assert!(matches!(
+            list.command,
+            Commands::Projects(ProjectsArgs {
+                command: ProjectsCommand::List
+            })
+        ));
+
+        let remove = Cli::try_parse_from([
+            "skills-manager-cli",
+            "projects",
+            "remove",
+            "my-project",
+        ])
+        .unwrap();
+        assert!(matches!(
+            remove.command,
+            Commands::Projects(ProjectsArgs {
+                command: ProjectsCommand::Remove { project_ref }
+            }) if project_ref == "my-project"
+        ));
+    }
+
+    fn test_project(id: &str, name: &str, path: &Path) -> ProjectRecord {
+        ProjectRecord {
+            id: id.to_string(),
+            name: name.to_string(),
+            path: path.to_string_lossy().into_owned(),
+            workspace_type: "project".to_string(),
+            linked_agent_key: None,
+            linked_agent_name: None,
+            disabled_path: None,
+            sort_order: 0,
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    #[test]
+    fn project_reference_resolution_prefers_id_then_path_then_unique_name() {
+        let tmp = tempdir().unwrap();
+        let alpha = test_project("id-a", "alpha", &tmp.path().join("alpha"));
+        let beta = test_project("alpha", "beta", &tmp.path().join("beta"));
+        let projects = vec![alpha.clone(), beta.clone()];
+
+        assert_eq!(resolve_project_reference(&projects, "alpha").unwrap().id, "alpha");
+        assert_eq!(
+            resolve_project_reference(&projects, &alpha.path)
+                .unwrap()
+                .id,
+            "id-a"
+        );
+        assert_eq!(
+            resolve_project_reference(&projects, "beta").unwrap().id,
+            "alpha"
+        );
+    }
+
+    #[test]
+    fn project_reference_resolution_rejects_ambiguous_names_and_missing_refs() {
+        let tmp = tempdir().unwrap();
+        let alpha = test_project("id-a", "alpha", &tmp.path().join("one/alpha"));
+        let other_alpha = test_project("id-b", "alpha", &tmp.path().join("two/alpha"));
+
+        let error = resolve_project_reference(&[alpha.clone(), other_alpha.clone()], "alpha")
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("ambiguous"));
+        assert!(message.contains("id-a"));
+        assert!(message.contains("id-b"));
+        assert!(resolve_project_reference(&[alpha], "missing").is_err());
+    }
+
+    #[test]
+    fn project_list_is_empty_then_reports_skill_count_and_json_metadata() {
+        let tmp = tempdir().unwrap();
+        let store = SkillStore::new(&tmp.path().join("skills.db")).unwrap();
+        assert!(list_project_entries(&store).unwrap().is_empty());
+
+        let project_path = tmp.path().join("repo");
+        fs::create_dir_all(project_path.join(".claude/skills/demo")).unwrap();
+        fs::write(
+            project_path.join(".claude/skills/demo/SKILL.md"),
+            "---\nname: demo\ndescription: test\n---\n",
+        )
+        .unwrap();
+        let project = app_lib::core::project_service::add_project(&store, &project_path).unwrap();
+
+        let listed = list_project_entries(&store).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, project.id);
+        assert_eq!(listed[0].skill_count, 1);
+        let json = serde_json::to_value(&listed[0]).unwrap();
+        assert_eq!(json["name"], "repo");
+        assert_eq!(json["skill_count"], 1);
+        assert!(json["created_at"].is_number());
+    }
+
+    #[test]
+    fn project_list_preserves_store_order() {
+        let tmp = tempdir().unwrap();
+        let store = SkillStore::new(&tmp.path().join("skills.db")).unwrap();
+        let mut later = test_project("id-later", "later", &tmp.path().join("later"));
+        later.sort_order = 1;
+        later.created_at = 1;
+        let mut earlier = test_project("id-earlier", "earlier", &tmp.path().join("earlier"));
+        earlier.sort_order = 0;
+        earlier.created_at = 2;
+        store.insert_project(&later).unwrap();
+        store.insert_project(&earlier).unwrap();
+
+        let listed = list_project_entries(&store).unwrap();
+
+        assert_eq!(
+            listed.iter().map(|project| project.id.as_str()).collect::<Vec<_>>(),
+            vec!["id-earlier", "id-later"]
+        );
+    }
+
+    #[test]
+    fn duplicate_project_add_uses_existing_cli_error_envelope() {
+        let tmp = tempdir().unwrap();
+        let store = SkillStore::new(&tmp.path().join("skills.db")).unwrap();
+        let project_path = tmp.path().join("repo");
+        fs::create_dir(&project_path).unwrap();
+        app_lib::core::project_service::add_project(&store, &project_path).unwrap();
+
+        let error = app_lib::core::project_service::add_project(&store, &project_path).unwrap_err();
+        let envelope = error_envelope(&map_app_err(error));
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["code"], "COMMAND_FAILED");
+        assert!(envelope["message"].as_str().unwrap().contains("already linked"));
+    }
+
+    #[test]
+    fn removing_project_record_leaves_project_files_intact() {
+        let tmp = tempdir().unwrap();
+        let store = SkillStore::new(&tmp.path().join("skills.db")).unwrap();
+        let project_path = tmp.path().join("repo");
+        fs::create_dir(&project_path).unwrap();
+        let project = app_lib::core::project_service::add_project(&store, &project_path).unwrap();
+
+        let resolved = resolve_project_reference(&store.get_all_projects().unwrap(), &project.id)
+            .unwrap();
+        store.delete_project(&resolved.id).unwrap();
+
+        assert!(store.get_all_projects().unwrap().is_empty());
+        assert!(project_path.is_dir());
+        assert!(project_path.join(".claude/skills").is_dir());
+        assert!(project_path.join(".claude/skills-disabled").is_dir());
     }
 
     #[test]
